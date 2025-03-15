@@ -3,8 +3,10 @@ import os
 from datetime import datetime
 import configparser
 import sys
-import pywintypes
 import win32api
+import glob
+import subprocess
+import platform
 
 DEFAULT_CONFIG = {
     "host": "localhost",
@@ -17,6 +19,11 @@ DEFAULT_CONFIG = {
     "use_articul": True,
     "plu_file_path": r"C:\REGOS BASE\plu",
     "scales_config_path": r"C:\Program Files (x86)\ШТРИХ-М\ШТРИХ-ПРИНТ\Automatic Loader\TrayLoader.ini",
+    "create_file_only_at_changes": True,
+    "handle_big_price": {
+        "active": True,
+        "divider": 100,
+    },
     "units": [
         {
             "name": "Весовой", # Весовой: 0, штучный: 1
@@ -179,16 +186,18 @@ def extract_ip_addresses_from_ini_and_create_path(ini_file_path: str, plu_file_p
             ip_int = config.getint(section, "IP")
 
             # Convert the integer to IP address
-            ip_address = int_to_ip(ip_int)
-            formatted_plu_path = fr"{plu_file_path}\{ip_address}.txt"
+            ip_address_str = int_to_ip(ip_int)
+            ip_address_num = ip_address_str.replace('-', '.')
+            formatted_plu_path = fr"{plu_file_path}\{ip_address_str}.txt"
             # Add the formatted IP to the list
-            if formatted_plu_path not in ip_addresses:
+
+            ping_status = ping_device(ip_address=ip_address_num)
+            if formatted_plu_path not in ip_addresses and ping_status:
                 ip_addresses.append(formatted_plu_path)
-                os.makedirs(os.path.dirname(formatted_plu_path), exist_ok=True)
 
     return ip_addresses
 
-def create_arg_query(units_data: list, latest_changes: dict):
+def create_arg_query(units_data: list, latest_changes: dict | None):
     list_data = []
     for value in units_data:
         list_data.append(value["id"])
@@ -202,7 +211,9 @@ def create_arg_query(units_data: list, latest_changes: dict):
         sys.exit(1)
 
     if latest_changes:
-        sql_args += f" AND (I.ITM_LAST_UPDATE > {latest_changes['items']} OR P.PRC_LAST_UPDATE > {latest_changes['prices']})"
+        item_last_change = datetime.strftime(latest_changes["items"], "%Y-%m-%d %H:%M:%S")
+        price_last_change = datetime.strftime(latest_changes["prices"], "%Y-%m-%d %H:%M:%S")
+        sql_args += f" AND (I.ITM_LAST_UPDATE > '{item_last_change}' OR P.PRC_LAST_UPDATE > '{price_last_change}')"
     return sql_args
 
 
@@ -212,42 +223,51 @@ def get_units_type(units: list):
         units_dict[unit_info["id"]] = unit_info["type"]
     return units_dict
 
-def find_missing_plu_numbers(numbers, count):
+def find_available_plu_numbers(numbers, count):
+    if not numbers:
+        return [i for i in range(1, count + 1)]
     num_set = set(numbers)
 
     missing_numbers = []
 
     current = 1
 
-    while len(missing_numbers) < count and current < 23000:
+    while len(missing_numbers) < count and current < 100000:
         if current not in num_set:
             missing_numbers.append(current)
         current += 1
 
     return missing_numbers
 
+def find_available_plu(numbers):
+    for num in range(1, 100000):
+        if num not in numbers:
+            return num
 
-def combine_plu_lists(old_plu_data_list, new_plu_data_list):
+def combine_plu_lists(old_plu_data_list: list, new_plu_data_list: list, articul_dict: dict | None,
+                      used_plus: dict | None) -> list:
+    combined_data = new_plu_data_list
     new_plu_dict = {}
+
     for item in new_plu_data_list:
         parts = item.split(';')
-        unique_id = parts[7]
+        unique_id = int(parts[7])
         new_plu_dict[unique_id] = item
 
-    combined_data = list(new_plu_data_list)
 
-    for old_item in old_plu_data_list:
-        parts = old_item.split(';')
-        unique_id = parts[7]
+    for old_plu in old_plu_data_list:
+        parts = old_plu.split(';')
+        unique_id = int(parts[7])
         if unique_id not in new_plu_dict:
-            combined_data.append(old_item)
+            combined_data.append(old_plu)
 
     return combined_data
 
 def get_short_path_name(path):
     try:
         return win32api.GetShortPathName(path)
-    except pywintypes.error:
+    except Exception as e:
+        write_log_file(f"Error getting short path name: {e}")
         return path
 
 
@@ -265,7 +285,7 @@ def save_readme_if_not_exists(readme_content=README_CONTENT, readme_path="README
     try:
         # Check if the file already exists
         if os.path.exists(readme_path):
-            print(f"README file already exists at '{readme_path}'. No changes made.")
+            write_log_file(f"README file already exists at '{readme_path}'. No changes made.")
             return False
 
         # Create the directory if it doesn't exist
@@ -277,11 +297,76 @@ def save_readme_if_not_exists(readme_content=README_CONTENT, readme_path="README
         with open(readme_path, 'w', encoding='utf-8') as readme_file:
             readme_file.write(readme_content)
 
-        print(f"README file successfully created at '{readme_path}'.")
+        write_log_file(f"README file successfully created at '{readme_path}'.")
         return True
 
     except Exception as e:
-        print(f"Error creating README file: {e}")
+        write_log_file(f"Error creating README file: {e}")
+        return False
+
+def get_key_by_value(dictionary, value):
+    for val in dictionary.values():
+        if val["code"] == value:
+            return val
+    return None
+
+def delete_txt_files(folder_path):
+    """
+    Delete all .txt files from the specified folder.
+
+    Args:
+        folder_path (str): The path to the folder containing .txt files
+
+    Returns:
+        int: Number of files deleted
+    """
+    # Create a pattern to match all .txt files in the folder
+    pattern = os.path.join(folder_path, "*.txt")
+
+    # Find all .txt files
+    txt_files = glob.glob(pattern)
+
+    # Count how many files we'll delete
+    count = len(txt_files)
+
+    # Delete each file
+    for file_path in txt_files:
+        try:
+            os.remove(file_path)
+            write_log_file(f"Deleted: {file_path}")
+        except Exception as e:
+            write_log_file(f"Error deleting {file_path}: {e}")
+
+    write_log_file(f"Total .txt files deleted: {count}")
+    return count
+
+
+def ping_device(ip_address, count=3, timeout=2):
+    """
+    Ping a device to check if it exists and is reachable on the network.
+
+    Args:
+        ip_address (str): The IP address or hostname of the device
+        count (int): Number of ping packets to send (default: 1)
+        timeout (int): Timeout in seconds (default: 2)
+
+    Returns:
+        bool: True if device responds to ping, False otherwise
+    """
+    # Determine the ping command based on the operating system
+    param = '-n' if platform.system().lower() == 'windows' else '-c'
+    timeout_param = '-w' if platform.system().lower() == 'windows' else '-W'
+
+    # Construct the ping command
+    command = ['ping', param, str(count), timeout_param, str(timeout), ip_address]
+
+    try:
+        # Run the ping command and capture the output
+        # subprocess.check_output will raise an exception if the command fails
+        subprocess.check_output(command, stderr=subprocess.STDOUT, universal_newlines=True)
+        return True
+    except subprocess.CalledProcessError:
+        # If ping fails, return False
         return False
 
 

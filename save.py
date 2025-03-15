@@ -1,10 +1,12 @@
 import fdb
-from datetime import datetime
 import time
 import os
 
 from helper import configure_settings, write_log_file, get_units_type, extract_ip_addresses_from_ini_and_create_path, \
-    combine_plu_lists, find_missing_plu_numbers, create_arg_query, get_short_path_name, save_readme_if_not_exists
+    combine_plu_lists, find_available_plu_numbers, create_arg_query, get_short_path_name, save_readme_if_not_exists, \
+    delete_txt_files
+
+# pyinstaller command: pyinstaller --onefile --name=ShtrixPrintPluAutoSaver save.py
 
 config = configure_settings()
 price_type = config["price_type"]
@@ -19,6 +21,8 @@ plu_file_path = config["plu_file_path"]
 check_time = config["check_time"]
 scales_config_path = config["scales_config_path"]
 units_dict = get_units_type(units=units)
+create_file_only_at_changes = config["create_file_only_at_changes"]
+handle_big_price = config["handle_big_price"]
 
 class SaveDataToTXT:
     def __init__(self):
@@ -28,7 +32,12 @@ class SaveDataToTXT:
         self.connection_status = False
         self.last_change_dict = {}
         self.last_changes_timestamp = 0
+        self.used_plus = {}
+        self.new_file_creation = False
+        self.temp_articul_dict = {}
+        os.makedirs(plu_file_path, exist_ok=True)
         save_readme_if_not_exists()
+        delete_txt_files(plu_file_path)
 
     def connect_fdb(self):
         try:
@@ -41,6 +50,7 @@ class SaveDataToTXT:
             )
         except fdb.fbcore.DatabaseError:
             write_log_file(f"Can't connect to the Firebird.")
+            self.connection_status = False
             return False
         else:
             self.connection_status = True
@@ -120,7 +130,7 @@ class SaveDataToTXT:
     def fetch_items(self):
         fetch_item_args = create_arg_query(units, self.last_change_dict)
         query_fetch_items = f"""
-        SELECT 
+        SELECT FIRST 22700 
             I.ITM_ID, 
             I.ITM_CODE,
             I.ITM_ARTICUL, 
@@ -136,13 +146,12 @@ class SaveDataToTXT:
             {fetch_item_args}
             ORDER BY I.ITM_ID ASC
         """
+
         try:
             fdb_cursor = self.fdb_conn.cursor()
 
             fdb_cursor.execute(query_fetch_items, (1, ))
             data = fdb_cursor.fetchall()
-            # for item in data:
-            #     print(item)
 
         except Exception as e:
             write_log_file(f"Error: {e}")
@@ -151,70 +160,152 @@ class SaveDataToTXT:
         else:
             return data
 
+    def fetch_articuls_info(self):
+        query_articuls_info = f"""
+        SELECT FIRST 22700 
+            I.ITM_CODE,
+            I.ITM_ARTICUL
+        FROM CTLG_ITM_ITEMS_REF I
+        WHERE I.ITM_DELETED_MARK = 0 
+          AND I.ITM_ARTICUL IS NOT NULL
+          AND I.ITM_ARTICUL SIMILAR TO '[1-9][0-9]*'  -- Only contains digits
+          AND I.ITM_ARTICUL NOT LIKE '%.%'       -- No decimal points
+          AND NOT EXISTS (
+              SELECT 1 FROM CTLG_ITM_ITEMS_REF I2
+              WHERE I2.ITM_ARTICUL = I.ITM_ARTICUL
+              AND I2.ITM_CODE <> I.ITM_CODE
+          ) 
+        ORDER BY I.ITM_CODE ASC
+        """
+        try:
+            fdb_cursor = self.fdb_conn.cursor()
+
+            fdb_cursor.execute(query_articuls_info, (1, ))
+            data = fdb_cursor.fetchall()
+
+        except Exception as e:
+            write_log_file(f"Error: {e}")
+            self.connection_status = False
+            return False
+        else:
+            if data:
+                return {item[1]: item[0] for item in data if int(item[1]) < 23000}
+            else:
+                return None
+
+
     def save_string_to_file(self, text, file_path):
         with open(file_path, 'w', encoding='windows-1251', errors="replace") as file:
             file.write(text)
 
 
     def save_to_txt(self):
-        last_changes = self.check_last_changes()
+        last_changes = self.check_last_changes() if create_file_only_at_changes else False
         if not last_changes:
             write_log_file(f"DB wasn't changed")
             return False
+
+        articuls_data = self.fetch_articuls_info() if use_articul else None
+        if articuls_data and articuls_data != self.temp_articul_dict:
+            self.temp_articul_dict = articuls_data
+            self.new_file_creation = True
+            self.last_change_dict = {}
+            self.used_plus = {}
 
         data = self.fetch_items()
         if not data:
             write_log_file("No items to save")
             return False
 
-        new_plu_list = []
-        added_plu_list = []
-        items_without_articul = []
+        plu_data = []
+        if use_articul and articuls_data:
+            for key, value in articuls_data.items():
+                self.used_plus[value] = {"code": value, "plu": int(key), "is_articul": True}
 
-        # Process items with valid articul first
-        if use_articul:
+            used_plu_list = [plu["plu"] for plu in self.used_plus.values()]
+            available_plu_list = find_available_plu_numbers(numbers=used_plu_list, count=len(data))
+            available_plu_pos = 0
             for item in data:
-                if item[2] and item[2].isdigit():
-                    articul = int(item[2])
-                    if articul not in added_plu_list and articul < 23000:
-                        unit_type = units_dict.get(item[4])
-                        new_plu_list.append(
-                            f"{articul};{item[3]};;{item[6] / divider_price};0;0;0;{item[1]};0;0;;01.01.01;{unit_type}")
-                        added_plu_list.append(articul)
+                unit_type = units_dict.get(item[4])
+                code = item[1]
+                price = item[6] / divider_price
+
+                if price >= 1000000:
+                    if handle_big_price['active']:
+                        price = price / handle_big_price['divider']
                     else:
-                        items_without_articul.append(item)
+                        continue
+
+                if articuls_data and item[2] in articuls_data.keys():
+                    plu_data.append(
+                        f"{int(item[2])};{item[3]};;{price};0;0;0;{code};0;0;;01.01.01;{unit_type}")
+
                 else:
-                    items_without_articul.append(item)
+                    # In this part of code there's no valid articul has been detected
+                    available_plu = available_plu_list[available_plu_pos]
+                    used_plu_val = self.used_plus.get(code)
+                    if used_plu_val and not used_plu_val["is_articul"]:
+                        # PLU was uploaded before and wasn't articul
+                        plu_data.append(
+                            f"{used_plu_val['plu']};{item[3]};;{price};0;0;0;{code};0;0;;01.01.01;{unit_type}")
+
+                    else:
+                        # PLU wasn't uploaded, it's purely new and not articul
+                        plu_data.append(
+                            f"{available_plu};{item[3]};;{price};0;0;0;{code};0;0;;01.01.01;{unit_type}")
+                        self.used_plus[code] = {"code": code, "plu": available_plu, "is_articul": False}
+                        available_plu_pos += 1
+
+        else:
+            used_plu_list = [plu["plu"] for plu in self.used_plus.values()]
+            available_plu_list = find_available_plu_numbers(numbers=used_plu_list, count=len(data))
+            available_plu_pos = 0
+            for item in data:
+                unit_type = units_dict.get(item[4])
+                code = item[1]
+                price = item[6] / divider_price
+                if price >= 1000000:
+                    if handle_big_price['active']:
+                        price = price / handle_big_price['divider']
+                    else:
+                        continue
+                available_plu = available_plu_list[available_plu_pos]
+                if code not in self.used_plus.keys():
+                    plu_data.append(
+                        f"{available_plu};{item[3]};;{price};0;0;0;{code};0;0;;01.01.01;{unit_type}")
+                    self.used_plus[code] = {"code": code, "plu": available_plu, "is_articul": False}
+                    available_plu_pos += 1
+
+                else:
+                    plu_data.append(
+                        f"{self.used_plus[code]["plu"]};{item[3]};;{price};0;0;0;{code};0;0;;01.01.01;{unit_type}")
 
 
-        # Process remaining items
-        configured_data = items_without_articul if use_articul else data
-        plu_numbers = find_missing_plu_numbers(added_plu_list, len(configured_data))
-
-        for index, item in enumerate(configured_data):
-            if index <= 22700:
-                unit_type = units_dict.get(item[4])  # Default empty if key not found
-                new_plu_list.append(
-                    f"{plu_numbers[index]};{item[3]};;{item[6] / divider_price};0;0;0;{item[1]};0;0;;01.01.01;{unit_type}")
-
-
-        string_data = "\n".join(new_plu_list)
+        string_data = "\n".join(plu_data)
         plu_files_path = extract_ip_addresses_from_ini_and_create_path(
             ini_file_path=scales_config_path,
             plu_file_path=plu_file_path
         )
-
+        scale_q = len(plu_files_path)
+        creation_q = 0
         for plu_path in plu_files_path:
-            if not os.path.exists(plu_path):
-                write_log_file(f"{len(new_plu_list)} plu's was saved into '{plu_path}'")
+            if not os.path.exists(plu_path) or self.new_file_creation:
+                write_log_file(f"{len(plu_data)} PLUs was saved into '{plu_path}'")
                 self.save_string_to_file(string_data, plu_path)
+
+                creation_q += 1
+                if creation_q >= scale_q:
+                    self.new_file_creation = False
+
             else:
                 with open(plu_path, 'r', encoding='windows-1251') as plu_file:
-                    old_plu_list = plu_file.readlines()
+                    old_plu_list = plu_file.read().splitlines()
 
-                combined_plu_data = combine_plu_lists(old_plu_data_list=old_plu_list, new_plu_data_list=new_plu_list)
+                new_item_q = len(plu_data)
+                combined_plu_data = combine_plu_lists(old_plu_data_list=old_plu_list, new_plu_data_list=plu_data,
+                                                      articul_dict=articuls_data, used_plus=self.used_plus)
                 combined_string_data = "\n".join(combined_plu_data)
-                write_log_file(f"{len(new_plu_list)} plu's was saved into '{plu_path}'")
+                write_log_file(f"{len(combined_plu_data)} PLUs was added into '{plu_path}'. Old PLU file wasn't uploaded to the scale. Number of new PLUs is {new_item_q}")
                 self.save_string_to_file(combined_string_data, plu_path)
 
         if last_changes:
@@ -223,9 +314,6 @@ class SaveDataToTXT:
 
         return True
 
-# save_data = SaveDataToTXT()
-# save_data.connect_fdb()
-# save_data.save_to_txt()
 
 def main():
     save_data = SaveDataToTXT()
@@ -236,6 +324,7 @@ def main():
         cash_status = save_data.check_cash_status()
         if cash_status == 1:
             save_data.save_to_txt()
+
         time.sleep(check_time)
 
 if __name__ == "__main__":

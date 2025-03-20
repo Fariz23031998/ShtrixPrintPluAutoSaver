@@ -4,7 +4,7 @@ import os
 
 from helper import configure_settings, write_log_file, get_units_type, extract_ip_addresses_from_ini_and_create_path, \
     combine_plu_lists, find_available_plu_numbers, create_arg_query, get_short_path_name, save_readme_if_not_exists, \
-    delete_txt_files
+    delete_txt_files, ping_device
 
 # pyinstaller command: pyinstaller --onefile --name=ShtrixPrintPluAutoSaver save.py
 
@@ -21,7 +21,7 @@ plu_file_path = config["plu_file_path"]
 check_time = config["check_time"]
 scales_config_path = config["scales_config_path"]
 units_dict = get_units_type(units=units)
-create_file_only_at_changes = config["create_file_only_at_changes"]
+only_changed_items = config["only_changed_items"]
 handle_big_price = config["handle_big_price"]
 
 class SaveDataToTXT:
@@ -33,8 +33,9 @@ class SaveDataToTXT:
         self.last_change_dict = {}
         self.last_changes_timestamp = 0
         self.used_plus = {}
-        self.new_file_creation = False
         self.temp_articul_dict = {}
+        self.scales_ips = {}
+        self.scales_statuses = {}
         os.makedirs(plu_file_path, exist_ok=True)
         save_readme_if_not_exists()
         delete_txt_files(plu_file_path)
@@ -127,8 +128,12 @@ class SaveDataToTXT:
                 return False
 
 
-    def fetch_items(self):
-        fetch_item_args = create_arg_query(units, self.last_change_dict)
+    def fetch_items(self, fetch_all: bool = False):
+        if fetch_all:
+            fetch_item_args = create_arg_query(units, self.last_change_dict, only_changed_items=False)
+        else:
+            fetch_item_args = create_arg_query(units, self.last_change_dict, only_changed_items=only_changed_items)
+
         query_fetch_items = f"""
         SELECT FIRST 22700 
             I.ITM_ID, 
@@ -139,9 +144,9 @@ class SaveDataToTXT:
             I.ITM_GROUP, 
             P.PRC_VALUE
         FROM CTLG_ITM_ITEMS_REF I
-        LEFT JOIN CTLG_ITM_PRICES_REF P ON I.ITM_ID = P.PRC_ITEM
+        LEFT JOIN CTLG_ITM_PRICES_REF P ON I.ITM_ID = P.PRC_ITEM 
+            AND P.PRC_PRICE_TYPE = ?
         WHERE I.ITM_DELETED_MARK = 0 
-            AND P.PRC_PRICE_TYPE = ? 
             AND P.PRC_VALUE <> 0 
             {fetch_item_args}
             ORDER BY I.ITM_ID ASC
@@ -198,21 +203,16 @@ class SaveDataToTXT:
         with open(file_path, 'w', encoding='windows-1251', errors="replace") as file:
             file.write(text)
 
-
-    def save_to_txt(self):
-        last_changes = self.check_last_changes() if create_file_only_at_changes else False
-        if not last_changes:
-            write_log_file(f"DB wasn't changed")
-            return False
-
+    def format_data(self, fetch_all: bool = False):
         articuls_data = self.fetch_articuls_info() if use_articul else None
         if articuls_data and articuls_data != self.temp_articul_dict:
             self.temp_articul_dict = articuls_data
-            self.new_file_creation = True
             self.last_change_dict = {}
             self.used_plus = {}
+            for scale_config in self.scales_ips.values():
+                scale_config["type"] = "new"
 
-        data = self.fetch_items()
+        data = self.fetch_items(fetch_all=fetch_all)
         if not data:
             write_log_file("No items to save")
             return False
@@ -280,22 +280,32 @@ class SaveDataToTXT:
                     plu_data.append(
                         f"{self.used_plus[code]["plu"]};{item[3]};;{price};0;0;0;{code};0;0;;01.01.01;{unit_type}")
 
+        return plu_data
+
+    def save_to_txt(self):
+        last_changes = self.check_last_changes()
+        if not last_changes:
+            write_log_file(f"DB wasn't changed")
+            return False
+
+        extract_ip_addresses_from_ini_and_create_path(
+            ini_file_path=scales_config_path,
+            plu_file_path=plu_file_path,
+            ip_addresses_dict=self.scales_ips,
+        )
+
+        plu_data = self.format_data()
+        if not plu_data:
+            return False
 
         string_data = "\n".join(plu_data)
-        plu_files_path = extract_ip_addresses_from_ini_and_create_path(
-            ini_file_path=scales_config_path,
-            plu_file_path=plu_file_path
-        )
-        scale_q = len(plu_files_path)
-        creation_q = 0
-        for plu_path in plu_files_path:
-            if not os.path.exists(plu_path) or self.new_file_creation:
-                write_log_file(f"{len(plu_data)} PLUs was saved into '{plu_path}'")
-                self.save_string_to_file(string_data, plu_path)
 
-                creation_q += 1
-                if creation_q >= scale_q:
-                    self.new_file_creation = False
+        for scale_config in self.scales_ips.values():
+            plu_path = scale_config["path"]
+            save_type = scale_config["type"]
+            if not os.path.exists(plu_path) or save_type == "new" or not only_changed_items:
+                write_log_file(f"{len(plu_data)} PLUs was saved into '{scale_config["path"]}'")
+                self.save_string_to_file(string_data, plu_path)
 
             else:
                 with open(plu_path, 'r', encoding='windows-1251') as plu_file:
@@ -303,7 +313,7 @@ class SaveDataToTXT:
 
                 new_item_q = len(plu_data)
                 combined_plu_data = combine_plu_lists(old_plu_data_list=old_plu_list, new_plu_data_list=plu_data,
-                                                      articul_dict=articuls_data, used_plus=self.used_plus)
+                                                      articul_dict=self.temp_articul_dict, used_plus=self.used_plus)
                 combined_string_data = "\n".join(combined_plu_data)
                 write_log_file(f"{len(combined_plu_data)} PLUs was added into '{plu_path}'. Old PLU file wasn't uploaded to the scale. Number of new PLUs is {new_item_q}")
                 self.save_string_to_file(combined_string_data, plu_path)

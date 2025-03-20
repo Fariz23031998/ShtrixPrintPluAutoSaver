@@ -19,7 +19,7 @@ DEFAULT_CONFIG = {
     "use_articul": True,
     "plu_file_path": r"C:\REGOS BASE\plu",
     "scales_config_path": r"C:\Program Files (x86)\ШТРИХ-М\ШТРИХ-ПРИНТ\Automatic Loader\TrayLoader.ini",
-    "create_file_only_at_changes": True,
+    "only_changed_items": True,
     "handle_big_price": {
         "active": True,
         "divider": 100,
@@ -39,7 +39,7 @@ DEFAULT_CONFIG = {
 }
 
 README_CONTENT = """
-
+Программа для загрузки PLU из Regos (firebird база данных) в файл. Загружает только новые или изменённые товары.
 # Руководство по настройке конфигурации
 
 ## Описание параметров конфигурации
@@ -155,10 +155,10 @@ def int_to_ip(ip_int):
     octet3 = (ip_int >> 8) & 255
     octet4 = ip_int & 255
 
-    return f"{octet4}-{octet3}-{octet2}-{octet1}"
+    return f"{octet4}.{octet3}.{octet2}.{octet1}"
 
 
-def extract_ip_addresses_from_ini_and_create_path(ini_file_path: str, plu_file_path: str):
+def extract_ip_addresses_from_ini_and_create_path(ini_file_path: str, plu_file_path: str, ip_addresses_dict: dict, save_type: str = "old") -> None:
     """
     Extract IP addresses from the given INI file, create path and return them as a list
     in the format [192-168-1-201, 192-168-1-202, ...]
@@ -166,9 +166,11 @@ def extract_ip_addresses_from_ini_and_create_path(ini_file_path: str, plu_file_p
     Args:
         ini_file_path (str): Path to the INI file
         plu_file_path (str): Path to the plu file
+        ip_addresses_dict (dict): Dictionary of IP addresses extracted from INI file.
+        save_type (str, optional): "new" if for creating new file, "old" using old plu file. Defaults to "old".
 
     Returns:
-        list: List of IP addresses in the specified format
+        None
     """
     # Create a ConfigParser object
     config = configparser.ConfigParser()
@@ -176,7 +178,6 @@ def extract_ip_addresses_from_ini_and_create_path(ini_file_path: str, plu_file_p
     # Read the INI file
     config.read(ini_file_path)
 
-    ip_addresses = []
 
     # Loop through all sections in the INI file
     for section in config.sections():
@@ -186,18 +187,12 @@ def extract_ip_addresses_from_ini_and_create_path(ini_file_path: str, plu_file_p
             ip_int = config.getint(section, "IP")
 
             # Convert the integer to IP address
-            ip_address_str = int_to_ip(ip_int)
-            ip_address_num = ip_address_str.replace('-', '.')
-            formatted_plu_path = fr"{plu_file_path}\{ip_address_str}.txt"
+            ip_address = int_to_ip(ip_int)
+            formatted_plu_path = fr"{plu_file_path}\{ip_address.replace(".", "-")}.txt"
             # Add the formatted IP to the list
+            ip_addresses_dict[ip_address] = {"path": formatted_plu_path, "type": save_type}
 
-            ping_status = ping_device(ip_address=ip_address_num)
-            if formatted_plu_path not in ip_addresses and ping_status:
-                ip_addresses.append(formatted_plu_path)
-
-    return ip_addresses
-
-def create_arg_query(units_data: list, latest_changes: dict | None):
+def create_arg_query(units_data: list, latest_changes: dict | None, only_changed_items: bool = True) -> str:
     list_data = []
     for value in units_data:
         list_data.append(value["id"])
@@ -210,7 +205,7 @@ def create_arg_query(units_data: list, latest_changes: dict | None):
     else:
         sys.exit(1)
 
-    if latest_changes:
+    if latest_changes and only_changed_items:
         item_last_change = datetime.strftime(latest_changes["items"], "%Y-%m-%d %H:%M:%S")
         price_last_change = datetime.strftime(latest_changes["prices"], "%Y-%m-%d %H:%M:%S")
         sql_args += f" AND (I.ITM_LAST_UPDATE > '{item_last_change}' OR P.PRC_LAST_UPDATE > '{price_last_change}')"
@@ -368,5 +363,7 @@ def ping_device(ip_address, count=3, timeout=2):
     except subprocess.CalledProcessError:
         # If ping fails, return False
         return False
+
+
 
 

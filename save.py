@@ -4,7 +4,7 @@ import os
 
 from helper import configure_settings, write_log_file, get_units_type, extract_ip_addresses_from_ini_and_create_path, \
     combine_plu_lists, find_available_plu_numbers, create_arg_query, get_short_path_name, save_readme_if_not_exists, \
-    delete_txt_files, ping_device
+    delete_txt_files
 
 # pyinstaller command: pyinstaller --onefile --name=ShtrixPrintPluAutoSaver save.py
 
@@ -114,7 +114,6 @@ class SaveDataToTXT:
             prices_last_update = fdb_cursor.fetchone()[0]
             prices_last_update_timestamp = prices_last_update.timestamp()
 
-
         except Exception as e:
             write_log_file(f"Error: {e}")
             self.connection_status = False
@@ -167,25 +166,30 @@ class SaveDataToTXT:
 
     def fetch_articuls_info(self):
         query_articuls_info = f"""
-        SELECT FIRST 22700 
-            I.ITM_CODE,
-            I.ITM_ARTICUL
-        FROM CTLG_ITM_ITEMS_REF I
-        WHERE I.ITM_DELETED_MARK = 0 
-          AND I.ITM_ARTICUL IS NOT NULL
-          AND I.ITM_ARTICUL SIMILAR TO '[1-9][0-9]*'  -- Only contains digits
-          AND I.ITM_ARTICUL NOT LIKE '%.%'       -- No decimal points
-          AND NOT EXISTS (
-              SELECT 1 FROM CTLG_ITM_ITEMS_REF I2
-              WHERE I2.ITM_ARTICUL = I.ITM_ARTICUL
-              AND I2.ITM_CODE <> I.ITM_CODE
-          ) 
-        ORDER BY I.ITM_CODE ASC
+        WITH UNIQUE_ARTICULS AS (
+            SELECT 
+                MIN(ITM_CODE) AS ITM_CODE,
+                ITM_ARTICUL
+            FROM CTLG_ITM_ITEMS_REF I
+            WHERE 
+                I.ITM_DELETED_MARK = 0 
+                AND I.ITM_ARTICUL IS NOT NULL
+                AND I.ITM_ARTICUL SIMILAR TO '[1-9][0-9]*'
+                AND I.ITM_ARTICUL NOT LIKE '%.%'
+            GROUP BY ITM_ARTICUL
+            HAVING COUNT(DISTINCT ITM_CODE) = 1
+        )
+        SELECT 
+            ITM_CODE,
+            ITM_ARTICUL
+        FROM UNIQUE_ARTICULS
+        ORDER BY ITM_CODE ASC
+        ROWS 22700
         """
         try:
             fdb_cursor = self.fdb_conn.cursor()
 
-            fdb_cursor.execute(query_articuls_info, (1, ))
+            fdb_cursor.execute(query_articuls_info)
             data = fdb_cursor.fetchall()
 
         except Exception as e:
@@ -197,7 +201,6 @@ class SaveDataToTXT:
                 return {item[1]: item[0] for item in data if int(item[1]) < 23000}
             else:
                 return None
-
 
     def save_string_to_file(self, text, file_path):
         with open(file_path, 'w', encoding='windows-1251', errors="replace") as file:
@@ -323,7 +326,6 @@ class SaveDataToTXT:
             self.last_change_dict["prices"] = last_changes[1]
 
         return True
-
 
 def main():
     save_data = SaveDataToTXT()

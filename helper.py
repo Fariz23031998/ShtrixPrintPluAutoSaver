@@ -7,6 +7,7 @@ import win32api
 import glob
 import subprocess
 import platform
+import openpyxl
 
 DEFAULT_CONFIG = {
     "host": "localhost",
@@ -365,5 +366,31 @@ def ping_device(ip_address, count=3, timeout=2):
         return False
 
 
+def write_tuples_to_excel(tuples_list, filename='output.xlsx', sheet_name='Sheet1'):
+    """
+    Write a list of tuples to an Excel file.
+
+    Parameters:
+    - tuples_list (list): List of tuples to be written to Excel
+    - filename (str, optional): Name of the Excel file to create. Defaults to 'output.xlsx'
+    - sheet_name (str, optional): Name of the worksheet. Defaults to 'Sheet1'
+
+    Returns:
+    - str: Path to the created Excel file
+    """
+    # Create a new workbook and select the active sheet
+    workbook = openpyxl.Workbook()
+    sheet = workbook.active
+    sheet.title = sheet_name
+
+    # Write the tuples to the Excel sheet
+    for row_index, tuple_data in enumerate(tuples_list, start=1):
+        for col_index, value in enumerate(tuple_data, start=1):
+            sheet.cell(row=row_index, column=col_index, value=value)
+
+    # Save the workbook
+    workbook.save(filename)
+
+    return filename
 
 
